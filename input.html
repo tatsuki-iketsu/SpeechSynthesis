@@ -1,0 +1,716 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TTS切り替えツール (Gemini & WebAPI)</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Inter Font -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #f7f9fb; }
+        .app-container { max-width: 900px; margin: 0 auto; padding: 20px; }
+        .speaker-card { transition: all 0.2s ease-in-out; }
+        .speaker-card:hover { transform: translateY(-2px); box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05); }
+        .btn { transition: all 0.2s; }
+        .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+        textarea { resize: vertical; }
+        .btn-shadow { box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1); }
+        .btn-primary:not(:disabled) { background-color: #10b981; color: white; }
+        .btn-secondary:not(:disabled) { background-color: #8b5cf6; color: white; }
+        .tab-btn { padding: 10px 15px; border-radius: 8px 8px 0 0; font-weight: 600; cursor: pointer; transition: background-color 0.2s; }
+        .tab-active { background-color: #ffffff; border-bottom: 4px solid #3b82f6; color: #3b82f6; }
+        .tab-inactive { background-color: #e5e7eb; color: #6b7280; }
+    </style>
+</head>
+<body>
+
+    <div id="app" class="app-container">
+        <!-- Application will be mounted here -->
+    </div>
+
+    <script>
+        // --- Global State and Initialization ---
+        const STORAGE_KEY = 'gemini-tts-state-v2';
+        let state = {
+            currentMode: 'gemini', // 'gemini' or 'browser'
+            apiKey: '',
+            speakers: [
+                { id: 1, name: 'Joe', voice: 'Kore', text: '高性能版では、会話形式の読み上げが可能です。APIキーを設定してください。', isEditingComposition: false },
+                { id: 2, name: 'Jane', voice: 'Puck', text: 'キーを設定したら、セリフを短くして試すことをお勧めします。長文だとエラーになりやすいです。', isEditingComposition: false },
+            ],
+            browserText: 'Web Speech API版では、APIキー不要で単一のテキストを読み上げます。',
+            browserRate: 1.0,
+            browserPitch: 1.0,
+            isLoading: false,
+            error: null,
+            audioUrl: null,
+        };
+
+        const VOICE_MAP = {
+            1: "Kore", 2: "Puck", 3: "Charon", 4: "Leda"
+        };
+
+        const availableVoices = [
+            { name: "Kore", label: "しっかりした (Kore)" },
+            { name: "Puck", label: "明るい (Puck)" },
+            { name: "Charon", label: "情報伝達に適した (Charon)" },
+            { name: "Leda", label: "若々しい (Leda)" },
+            { name: "Zephyr", label: "元気な (Zephyr)" },
+            { name: "Fenrir", label: "興奮した (Fenrir)" },
+        ];
+
+        // --- Utility Functions ---
+
+        // Local Storage Management
+        const loadState = () => {
+            const storedState = localStorage.getItem(STORAGE_KEY);
+            if (storedState) {
+                try {
+                    const parsed = JSON.parse(storedState);
+                    // Merge with current state to ensure all properties exist
+                    state = { ...state, ...parsed };
+                    // Ensure isEditingComposition is reset on load
+                    if (state.speakers) {
+                        state.speakers = state.speakers.map(s => ({ ...s, isEditingComposition: false }));
+                    }
+                } catch (e) {
+                    console.error("Could not parse stored state, using default.", e);
+                }
+            }
+        };
+
+        const saveState = () => {
+            const stateToSave = {
+                currentMode: state.currentMode,
+                apiKey: state.apiKey,
+                speakers: state.speakers.map(s => ({ id: s.id, name: s.name, voice: s.voice, text: s.text })),
+                browserText: state.browserText,
+                browserRate: state.browserRate,
+                browserPitch: state.browserPitch,
+            };
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(stateToSave));
+        };
+
+        // Base64 to ArrayBuffer
+        const base64ToArrayBuffer = (base64) => {
+            const binaryString = atob(base64);
+            const len = binaryString.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+            return bytes.buffer;
+        };
+
+        // PCM to WAV converter
+        const writeString = (view, offset, str) => {
+            for (let i = 0; i < str.length; i++) {
+                view.setUint8(offset + i, str.charCodeAt(i));
+            }
+        };
+
+        const pcmToWav = (pcm16, sampleRate) => {
+            const numChannels = 1;
+            const bitsPerSample = 16;
+            const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+            const blockAlign = numChannels * (bitsPerSample / 8);
+            const dataSize = pcm16.length * (bitsPerSample / 8);
+            const buffer = new ArrayBuffer(44 + dataSize);
+            const view = new DataView(buffer);
+
+            // RIFF identifier
+            writeString(view, 0, 'RIFF');
+            // File size
+            view.setUint32(4, 36 + dataSize, true);
+            // RIFF type
+            writeString(view, 8, 'WAVE');
+            // format chunk identifier
+            writeString(view, 12, 'fmt ');
+            // format chunk length
+            view.setUint32(16, 16, true);
+            // sample format (1 = PCM)
+            view.setUint16(20, 1, true);
+            // number of channels
+            view.setUint16(22, numChannels, true);
+            // sample rate
+            view.setUint32(24, sampleRate, true);
+            // byte rate
+            view.setUint32(28, byteRate, true);
+            // block align
+            view.setUint16(32, blockAlign, true);
+            // bits per sample
+            view.setUint16(34, bitsPerSample, true);
+            // data chunk identifier
+            writeString(view, 36, 'data');
+            // data chunk length
+            view.setUint32(40, dataSize, true);
+
+            // Write PCM data
+            let offset = 44;
+            for (let i = 0; i < pcm16.length; i++, offset += 2) {
+                view.setInt16(offset, pcm16[i], true);
+            }
+
+            return new Blob([view], { type: 'audio/wav' });
+        };
+
+
+        // --- Event Handlers and Core Logic ---
+
+        // Renderer
+        const render = () => {
+            const appDiv = document.getElementById('app');
+            appDiv.innerHTML = `
+                <h1 class="text-4xl font-extrabold text-gray-900 mb-6 text-center">TTS 切り替えツール</h1>
+                
+                <!-- Mode Tabs -->
+                <div class="flex border-b-2 border-gray-200 mb-8">
+                    <div id="tab-gemini" 
+                         class="tab-btn ${state.currentMode === 'gemini' ? 'tab-active' : 'tab-inactive'} mr-2" 
+                         onclick="setMode('gemini')">
+                        高性能版 (Gemini TTS)
+                    </div>
+                    <div id="tab-browser" 
+                         class="tab-btn ${state.currentMode === 'browser' ? 'tab-active' : 'tab-inactive'}" 
+                         onclick="setMode('browser')">
+                        ブラウザ版 (APIキー不要)
+                    </div>
+                </div>
+
+                ${state.currentMode === 'gemini' ? renderGeminiUI() : renderBrowserUI()}
+
+                <!-- Error Display -->
+                ${state.error ? `
+                    <div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded-xl relative mt-6" role="alert">
+                        <strong class="font-bold">エラー: </strong>
+                        <span class="block sm:inline">${state.error}</span>
+                        ${state.currentMode === 'gemini' ? `<p class="text-sm mt-1">※セリフが長すぎるか、APIキーが間違っている可能性があります。</p>` : ''}
+                    </div>
+                ` : ''}
+
+                <!-- Audio Player (for Gemini Mode) -->
+                ${state.currentMode === 'gemini' && state.audioUrl && !state.isLoading ? `
+                    <div class="mt-6 p-4 bg-white rounded-xl shadow-lg border border-gray-200">
+                        <h3 class="text-lg font-semibold mb-2 text-gray-700">生成された音声プレビュー</h3>
+                        <audio controls src="${state.audioUrl}" class="w-full"></audio>
+                        <p class="text-sm text-gray-500 mt-2">プレビューが生成されました。何度でも再生できます。</p>
+                    </div>
+                ` : ''}
+            `;
+            // Re-attach event listeners for dynamic elements if necessary, 
+            // though most input/button events are handled via inline onclick/oninput/onchange.
+        };
+
+        const setMode = (mode) => {
+            if (state.currentMode !== mode) {
+                state.currentMode = mode;
+                // Clear state when switching
+                state.isLoading = false;
+                state.error = null;
+                state.audioUrl = null;
+                if (mode === 'browser') {
+                    // Stop any ongoing speech synthesis if switching to Gemini
+                    if ('speechSynthesis' in window) {
+                        window.speechSynthesis.cancel();
+                    }
+                }
+                saveState();
+                render();
+            }
+        };
+
+        // --- Renders for Gemini (High Performance) Mode ---
+
+        const renderGeminiUI = () => {
+            const isTextMissing = state.speakers.some(speaker => speaker.text.trim().length === 0);
+            const isComposing = state.speakers.some(speaker => speaker.isEditingComposition);
+            const isActionDisabled = state.isLoading || isTextMissing || !state.apiKey || isComposing;
+
+            const speakerCards = state.speakers.map(speaker => `
+                <div class="speaker-card p-6 border border-gray-200 rounded-xl bg-white shadow-md">
+                    <div class="flex justify-between items-center mb-4">
+                        <h3 class="text-xl font-semibold text-gray-800">スピーカー ${speaker.id}</h3>
+                        <select
+                            id="voice-${speaker.id}"
+                            onchange="updateSpeakerVoice(${speaker.id}, this.value); render();"
+                            class="p-2 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500 bg-gray-50"
+                        >
+                            ${availableVoices.map(voice => `<option value="${voice.name}" ${speaker.voice === voice.name ? 'selected' : ''}>${voice.label} (${voice.name})</option>`).join('')}
+                        </select>
+                    </div>
+
+                    <input
+                        type="text"
+                        placeholder="話者の名前 (例: Joe)"
+                        value="${speaker.name}"
+                        oninput="updateSpeakerName(${speaker.id}, this.value); saveState();"
+                        class="w-full p-2 mb-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 transition duration-150 ease-in-out"
+                    />
+
+                    <textarea
+                        id="text-${speaker.id}"
+                        placeholder="このスピーカーのセリフを入力してください (IME修正済み)"
+                        rows="3"
+                        oninput="handleTextChange(${speaker.id}, this.value); saveState();"
+                        oncompositionstart="setCompositionState(${speaker.id}, true); render();"
+                        oncompositionend="setCompositionState(${speaker.id}, false); render();"
+                        class="w-full p-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500 transition duration-150 ease-in-out"
+                    >${speaker.text}</textarea>
+                    
+                    ${speaker.isEditingComposition ? '<p class="text-sm text-red-500 mt-1">※日本語入力中は処理を一時停止しています</p>' : ''}
+                </div>
+            `).join('');
+
+            return `
+                <h2 class="text-2xl font-semibold text-gray-800 mb-6">高性能版 (Gemini TTS) 設定</h2>
+
+                <!-- API Key Input and Status -->
+                <div class="p-4 mb-6 rounded-xl shadow-lg" style="background-color: ${state.apiKey ? '#ecfdf5' : '#fffbe5'}; border-color: ${state.apiKey ? '#10b981' : '#f59e0b'}; border: 1px solid;">
+                    <h3 class="text-xl font-semibold mb-3" style="color: ${state.apiKey ? '#059669' : '#b45309'};">
+                        ${state.apiKey ? '🔑 APIキーが設定されました' : '🚨 Gemini API Keyを入力してください'}
+                    </h3>
+                    <input
+                        type="text"
+                        placeholder="APIキーをここに入力 (sk-から始まる文字列)"
+                        value="${state.apiKey}"
+                        oninput="updateApiKey(this.value); saveState(); render();"
+                        class="w-full p-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500 transition duration-150 ease-in-out"
+                    />
+                    <p class="text-sm mt-2 text-gray-500">APIキーはブラウザのローカルストレージにのみ保存されます。</p>
+                </div>
+
+                <!-- Speakers List -->
+                <div class="space-y-4 mb-8">${speakerCards}</div>
+
+                <!-- Add/Remove Speaker -->
+                <div class="flex justify-center mb-8 space-x-4">
+                    <button
+                        onclick="addSpeaker(); render();"
+                        ${state.speakers.length >= 4 ? 'disabled' : ''}
+                        class="btn p-3 rounded-xl bg-purple-100 text-purple-700 font-medium hover:bg-purple-200 flex items-center btn-shadow"
+                    >
+                        <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v3m0 0v3m0-3h3m-3 0H9m12 0a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                        スピーカー追加 (最大4人)
+                    </button>
+                    <button
+                        onclick="removeSpeaker(); render();"
+                        ${state.speakers.length <= 1 ? 'disabled' : ''}
+                        class="btn p-3 rounded-xl bg-red-100 text-red-700 font-medium hover:bg-red-200 flex items-center btn-shadow"
+                    >
+                        <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12H9m12 0a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                        スピーカー削除
+                    </button>
+                </div>
+
+                <!-- Action Buttons -->
+                <div class="flex justify-center items-center space-x-4 mb-6">
+                    <button
+                        onclick="generateAudio('preview');"
+                        ${isActionDisabled ? 'disabled' : ''}
+                        class="btn btn-primary p-4 rounded-xl font-bold text-lg flex items-center justify-center w-1/2 btn-shadow hover:bg-green-600 focus:outline-none focus:ring-4 focus:ring-green-300 transition duration-200"
+                    >
+                        ${state.isLoading ? `
+                            <svg class="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                            音声生成中...
+                        ` : `
+                            <svg class="w-6 h-6 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.807v4.386a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                            音声プレビュー
+                        `}
+                    </button>
+
+                    <button
+                        onclick="generateAudio('download');"
+                        ${isActionDisabled ? 'disabled' : ''}
+                        class="btn btn-secondary p-4 rounded-xl font-bold text-lg flex items-center justify-center w-1/2 btn-shadow hover:bg-indigo-600 focus:outline-none focus:ring-4 focus:ring-indigo-300 transition duration-200"
+                    >
+                        <svg class="w-6 h-6 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
+                        WAVファイルをダウンロード
+                    </button>
+                </div>
+            `;
+        };
+
+        // --- Renders for Browser (Web Speech API) Mode ---
+
+        const renderBrowserUI = () => {
+            const isSpeaking = 'speechSynthesis' in window && window.speechSynthesis.speaking;
+
+            return `
+                <h2 class="text-2xl font-semibold text-gray-800 mb-6">ブラウザ版 (Web Speech API) 設定</h2>
+
+                <div class="p-6 border border-gray-200 rounded-xl bg-white shadow-md space-y-4">
+                    <p class="text-sm text-gray-500 mb-4">※この機能はブラウザに内蔵されているため、APIキーやインターネット接続は不要です。複数の話者の切り分けはできません。</p>
+
+                    <!-- Textarea -->
+                    <div>
+                        <label class="block text-gray-700 font-medium mb-1">読み上げテキスト</label>
+                        <textarea
+                            id="browser-text"
+                            placeholder="読み上げたい文章を入力してください"
+                            rows="5"
+                            oninput="updateBrowserText(this.value); saveState();"
+                            class="w-full p-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500 transition duration-150 ease-in-out"
+                        >${state.browserText}</textarea>
+                    </div>
+
+                    <!-- Rate and Pitch Controls -->
+                    <div class="flex space-x-6">
+                        <div class="w-1/2">
+                            <label class="block text-gray-700 font-medium mb-1">速度 (Rate: ${state.browserRate.toFixed(1)})</label>
+                            <input
+                                type="range"
+                                min="0.5" max="2.0" step="0.1"
+                                value="${state.browserRate}"
+                                oninput="updateBrowserRate(this.value); saveState(); render();"
+                                class="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"
+                            >
+                        </div>
+                        <div class="w-1/2">
+                            <label class="block text-gray-700 font-medium mb-1">ピッチ (Pitch: ${state.browserPitch.toFixed(1)})</label>
+                            <input
+                                type="range"
+                                min="0.0" max="2.0" step="0.1"
+                                value="${state.browserPitch}"
+                                oninput="updateBrowserPitch(this.value); saveState(); render();"
+                                class="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"
+                            >
+                        </div>
+                    </div>
+                    
+                    <!-- Voice Selector (Optional) -->
+                    <div class="pt-2">
+                        <label class="block text-gray-700 font-medium mb-1">音声選択 (ブラウザ依存)</label>
+                        <select id="browser-voice" class="p-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500 bg-white w-full">
+                            <!-- Voices will be populated by JavaScript -->
+                        </select>
+                    </div>
+
+                    <!-- Action Buttons -->
+                    <div class="flex justify-center items-center space-x-4 pt-4">
+                        <button
+                            onclick="speakBrowserText();"
+                            ${isSpeaking || state.browserText.trim() === '' ? 'disabled' : ''}
+                            class="btn p-4 rounded-xl font-bold text-lg flex items-center justify-center w-1/2 btn-primary btn-shadow hover:bg-green-600 focus:outline-none focus:ring-4 focus:ring-green-300 transition duration-200"
+                        >
+                            <svg class="w-6 h-6 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.536 8.464a.5.5 0 00-.707 0l-4.243 4.243a.5.5 0 00.707.707l4.243-4.243a.5.5 0 000-.707z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 21a9 9 0 110-18 9 9 0 010 18zM12 6v6"></path></svg>
+                            読み上げ開始
+                        </button>
+                        <button
+                            onclick="stopBrowserText();"
+                            ${!isSpeaking ? 'disabled' : ''}
+                            class="btn p-4 rounded-xl font-bold text-lg flex items-center justify-center w-1/2 bg-red-500 text-white btn-shadow hover:bg-red-600 focus:outline-none focus:ring-4 focus:ring-red-300 transition duration-200"
+                        >
+                            <svg class="w-6 h-6 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                            停止
+                        </button>
+                    </div>
+                </div>
+            `;
+        };
+
+        // --- Gemini Mode State Management ---
+
+        const updateApiKey = (key) => {
+            state.apiKey = key.trim();
+        };
+
+        const setCompositionState = (id, isComposing) => {
+            const speaker = state.speakers.find(s => s.id === id);
+            if (speaker) {
+                speaker.isEditingComposition = isComposing;
+                // Re-render immediately to disable buttons or show warnings
+                render(); 
+            }
+        };
+
+        const handleTextChange = (id, newText) => {
+            const speaker = state.speakers.find(s => s.id === id);
+            if (speaker) {
+                speaker.text = newText;
+            }
+        };
+
+        const updateSpeakerName = (id, newName) => {
+            const speaker = state.speakers.find(s => s.id === id);
+            if (speaker) {
+                speaker.name = newName;
+            }
+        };
+
+        const updateSpeakerVoice = (id, newVoice) => {
+            const speaker = state.speakers.find(s => s.id === id);
+            if (speaker) {
+                speaker.voice = newVoice;
+            }
+        };
+
+        const addSpeaker = () => {
+            if (state.speakers.length >= 4) return;
+            const newId = (Math.max(...state.speakers.map(s => s.id)) || 0) + 1;
+            const defaultVoice = availableVoices[newId % availableVoices.length].name;
+            state.speakers.push({
+                id: newId,
+                name: `Speaker${newId}`,
+                voice: defaultVoice,
+                text: '',
+                isEditingComposition: false
+            });
+        };
+
+        const removeSpeaker = () => {
+            if (state.speakers.length <= 1) return;
+            state.speakers.pop();
+        };
+
+        // --- Gemini Mode API Call ---
+
+        const formatConversationText = (speakers) => {
+            return "TTS the following conversation:\n" +
+                speakers.map(s => `${s.name}: ${s.text}`).join('\n');
+        };
+
+        const getVoiceConfig = (speakers) => {
+            if (speakers.length > 1) {
+                return {
+                    multiSpeakerVoiceConfig: {
+                        speakerVoiceConfigs: speakers.map(s => ({
+                            speaker: s.name,
+                            voiceConfig: { prebuiltVoiceConfig: { voiceName: s.voice } }
+                        }))
+                    }
+                };
+            } else {
+                return {
+                    voiceConfig: {
+                        prebuiltVoiceConfig: { voiceName: speakers[0].voice }
+                    }
+                };
+            }
+        };
+
+        const generateAudio = async (mode) => {
+            const isTextMissing = state.speakers.some(speaker => speaker.text.trim().length === 0);
+            if (!state.apiKey || isTextMissing) return;
+
+            state.isLoading = true;
+            state.error = null;
+            state.audioUrl = null;
+            render();
+
+            const speakers = state.speakers;
+            const userPrompt = formatConversationText(speakers);
+            const voiceConfig = getVoiceConfig(speakers);
+
+            const payload = {
+                contents: [{ parts: [{ text: userPrompt }] }],
+                generationConfig: {
+                    responseModalities: ["AUDIO"],
+                    speechConfig: voiceConfig
+                },
+                model: "gemini-2.5-flash-preview-tts"
+            };
+
+            const apiKey = state.apiKey;
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${apiKey}`;
+
+            try {
+                const response = await fetchWithRetry(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                }, 3);
+
+                const result = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(`API Error: ${result.error?.message || response.statusText}`);
+                }
+                
+                const part = result?.candidates?.[0]?.content?.parts?.[0];
+                const audioData = part?.inlineData?.data;
+                const mimeType = part?.inlineData?.mimeType;
+
+                if (!audioData || !mimeType || !mimeType.startsWith("audio/")) {
+                    throw new Error("APIからの音声データが不正です。セリフが長すぎるか、APIキーを確認してください。");
+                }
+                
+                const rateMatch = mimeType.match(/rate=(\d+)/);
+                const sampleRate = rateMatch ? parseInt(rateMatch[1], 10) : 24000; 
+
+                const pcmData = base64ToArrayBuffer(audioData);
+                const pcm16 = new Int16Array(pcmData);
+
+                const wavBlob = pcmToWav(pcm16, sampleRate);
+
+                if (mode === 'preview') {
+                    if (state.audioUrl) URL.revokeObjectURL(state.audioUrl);
+                    
+                    const audioUrl = URL.createObjectURL(wavBlob);
+                    state.audioUrl = audioUrl;
+
+                    const audio = new Audio(audioUrl);
+                    audio.play().catch(e => console.error("Audio playback failed:", e));
+
+                } else if (mode === 'download') {
+                    const url = URL.createObjectURL(wavBlob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `gemini_tts_audio_${new Date().toISOString()}.wav`;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                }
+
+            } catch (e) {
+                console.error("Audio generation failed:", e);
+                state.error = e.message || "音声生成中に予期せぬエラーが発生しました。";
+            } finally {
+                state.isLoading = false;
+                render();
+            }
+        };
+
+        // Exponential Backoff Fetch
+        const fetchWithRetry = async (url, options, retries) => {
+            for (let i = 0; i < retries; i++) {
+                try {
+                    const response = await fetch(url, options);
+                    if (response.status !== 429) { 
+                        return response;
+                    }
+                    const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                } catch (error) {
+                    const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+            }
+            throw new Error(`API呼び出しが ${retries} 回失敗しました。レート制限またはネットワークの問題を確認してください。`);
+        };
+
+
+        // --- Browser Mode Logic ---
+
+        let synth = window.speechSynthesis;
+        let voiceSelectInitialized = false;
+
+        const populateVoiceList = () => {
+            if (!synth) return;
+
+            const voices = synth.getVoices();
+            const select = document.getElementById('browser-voice');
+            
+            if (select) {
+                // Clear existing options
+                select.innerHTML = '';
+                
+                // Filter and add Japanese voices first
+                const japaneseVoices = voices.filter(voice => voice.lang.startsWith('ja'));
+                if (japaneseVoices.length > 0) {
+                    const optgroup = document.createElement('optgroup');
+                    optgroup.label = "日本語 (Japanese)";
+                    japaneseVoices.forEach(voice => {
+                        const option = document.createElement('option');
+                        option.textContent = `${voice.name} (${voice.lang})`;
+                        option.value = voice.name;
+                        option.defaultSelected = true;
+                        optgroup.appendChild(option);
+                    });
+                    select.appendChild(optgroup);
+                }
+
+                // Add all other voices
+                const otherVoices = voices.filter(voice => !voice.lang.startsWith('ja'));
+                if (otherVoices.length > 0) {
+                    const optgroup = document.createElement('optgroup');
+                    optgroup.label = "その他 (Other Languages)";
+                    otherVoices.forEach(voice => {
+                        const option = document.createElement('option');
+                        option.textContent = `${voice.name} (${voice.lang})`;
+                        option.value = voice.name;
+                        optgroup.appendChild(option);
+                    });
+                    select.appendChild(optgroup);
+                }
+            }
+        };
+        
+        // Ensure voices are available when the browser loads them
+        if (synth && synth.onvoiceschanged !== undefined) {
+            synth.onvoiceschanged = () => {
+                if (state.currentMode === 'browser') {
+                    populateVoiceList();
+                    voiceSelectInitialized = true;
+                }
+            };
+        }
+
+
+        const speakBrowserText = () => {
+            if (!synth || state.browserText.trim() === '') return;
+
+            // Stop any current speech
+            if (synth.speaking) {
+                synth.cancel();
+            }
+
+            const utterThis = new SpeechSynthesisUtterance(state.browserText);
+            
+            // Set properties from state
+            utterThis.rate = state.browserRate;
+            utterThis.pitch = state.browserPitch;
+
+            // Set selected voice
+            const selectedVoiceName = document.getElementById('browser-voice')?.value;
+            if (selectedVoiceName) {
+                const selectedVoice = synth.getVoices().find(v => v.name === selectedVoiceName);
+                if (selectedVoice) {
+                    utterThis.voice = selectedVoice;
+                }
+            }
+            
+            utterThis.onstart = () => { render(); };
+            utterThis.onend = () => { render(); };
+            utterThis.onerror = (event) => {
+                console.error('SpeechSynthesisUtterance.onerror', event);
+                state.error = '読み上げエラーが発生しました。ブラウザの音声設定を確認してください。';
+                render();
+            };
+
+            synth.speak(utterThis);
+            render(); // Re-render to disable button
+        };
+
+        const stopBrowserText = () => {
+            if (synth && synth.speaking) {
+                synth.cancel();
+                render();
+            }
+        };
+
+        const updateBrowserText = (newText) => {
+            state.browserText = newText;
+        };
+        const updateBrowserRate = (newRate) => {
+            state.browserRate = parseFloat(newRate);
+        };
+        const updateBrowserPitch = (newPitch) => {
+            state.browserPitch = parseFloat(newPitch);
+        };
+
+        // --- Initial Load ---
+        window.onload = () => {
+            loadState();
+            render();
+            
+            // Populate voices only after render and when they are loaded
+            if (synth && synth.getVoices().length > 0) {
+                populateVoiceList();
+            }
+        };
+    </script>
+</body>
+</html>
